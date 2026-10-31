@@ -19,10 +19,12 @@ No keys needed — public RPCs only. Output: JSON report + stdout table.
 import requests, json, datetime, sys
 
 RPCS = [
-    "https://bsc-rpc.publicnode.com",
+    # 48.club has a complete logs index; the big-name free endpoints
+    # silently drop logs (verified 10-27/10-28 vs official records).
+    "https://rpc-bsc.48.club",
     "https://bsc-dataseed.binance.org",
     "https://bsc-dataseed1.defibit.io",
-    "https://bsc.drpc.org",
+    "https://bsc-rpc.publicnode.com",
 ]
 TOK = "0x90c8889f428f9ebb77bb8f15cad3a50a9ac680df"          # FLAPJAX (BSC)
 TREAS = "0x7c34e9e21ee28a49ff0b84b61774119e6633359f"       # public treasury
@@ -136,17 +138,31 @@ def main():
     a = b0
     while a <= b1:
         z = min(a + CHUNK - 1, b1)
-        part, via = rpc("eth_getLogs", [{"address": TOK, "fromBlock": hex(a),
-            "toBlock": hex(z), "topics": [TRANSFER, pad(TREAS)]}])
-        if part is None:
-            print(f"WARN: getLogs failed {a}..{z}, retrying")
-            part, via = rpc("eth_getLogs", [{"address": TOK,
-                "fromBlock": hex(a), "toBlock": hex(z),
-                "topics": [TRANSFER, pad(TREAS)]}])
-            via = via or "FAILED"
-            part = part or []
-        print(f"  chunk {a}..{z}: {len(part)} logs via {via}")
-        logs.extend(part)
+        # Query EVERY chunk on ALL RPCs and merge — public nodes silently
+        # truncate getLogs both with and without topic filters (verified:
+        # filtered=7/17, unfiltered=5/31 on days where officials have 17/31).
+        merged, used = {}, []
+        for u in RPCS:
+            try:
+                j = requests.post(u, json={"jsonrpc": "2.0", "id": 1,
+                    "method": "eth_getLogs",
+                    "params": [{"address": TOK, "fromBlock": hex(a),
+                        "toBlock": hex(z), "topics": [TRANSFER]}]},
+                    timeout=30).json()
+                part = j.get("result")
+                if part is not None:
+                    for l in part:
+                        merged[(l["transactionHash"], l["logIndex"])] = l
+                    used.append(u.split("//")[1].split("/")[0])
+            except Exception:
+                pass
+            if used and used[0].startswith("rpc-bsc.48.club"):
+                break        # trusted indexer answered — skip slow fallbacks
+        part = list(merged.values())
+        kept = [l for l in part if l["topics"][1][-40:] == TREAS[2:]]
+        print(f"  chunk {a}..{z}: {len(part)} logs ({len(kept)} treasury)"
+              f" via {len(used)} RPCs")
+        logs.extend(kept)
         a = z + 1
     seen = set()
     logs = [l for l in logs if not (
