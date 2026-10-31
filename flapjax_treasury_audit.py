@@ -61,14 +61,38 @@ def parse_utc(s):
 
 
 def block_at(ts):
-    lo, hi = 130400000, latest()
+    hi = latest()
+    lo = max(hi - 28800, 0)
+    while lo > 0:                      # walk back until below the target
+        t = bts(lo)
+        if t is not None and t < ts:
+            break
+        lo -= 28800
+    lo = max(lo, 0)
     while lo < hi:
         mid = (lo + hi) // 2
-        if bts(mid) < ts:
+        t = bts(mid)
+        if t is None:
+            t = bts(mid)               # one retry, then treat as future
+        if t is not None and t < ts:
             lo = mid + 1
         else:
             hi = mid
     return lo
+
+
+# archive-capable RPC for historical balance/nonce (public endpoints
+# refuse archive state: publicnode wants a paid token)
+ARPC = "https://bsc-mainnet.public.blastapi.io"
+
+
+def arpc(method, params, timeout=30):
+    try:
+        j = requests.post(ARPC, json={"jsonrpc": "2.0", "id": 1,
+            "method": method, "params": params}, timeout=timeout).json()
+        return j.get("result")
+    except Exception:
+        return None
 
 
 def first_funder(addr, hint_hi=None):
@@ -77,21 +101,21 @@ def first_funder(addr, hint_hi=None):
     lo, hi = 0, hint_hi or latest()
 
     def pred(b):
-        bal, _ = rpc("eth_getBalance", [addr, hex(b)])
+        bal = arpc("eth_getBalance", [addr, hex(b)])
         if bal and int(bal, 16) > 0:
             return True
-        non, _ = rpc("eth_getTransactionCount", [addr, hex(b)])
+        non = arpc("eth_getTransactionCount", [addr, hex(b)])
         return bool(non) and int(non, 16) > 0
     if not pred(hi):
-        return None, "never funded"
+        return None, "never funded before transfer"
     while lo < hi:
         mid = (lo + hi) // 2
         if pred(mid):
             hi = mid
         else:
             lo = mid + 1
-    blk, _ = rpc("eth_getBlockByNumber", [hex(lo), True])
-    for tx in blk["transactions"]:
+    blk = arpc("eth_getBlockByNumber", [hex(lo), True])
+    for tx in (blk or {}).get("transactions", []):
         if tx.get("to") and tx["to"].lower() == addr.lower() \
                 and int(tx["value"], 16) > 0:
             return {"funder": tx["from"], "tx": tx["hash"], "block": lo,
@@ -141,8 +165,12 @@ def main():
     uniq = {r[0] for r in recips}
     print(f"total: {total:,.0f} FLAPJAX to {len(recips)} transfers"
           f" / {len(uniq)} unique recipients")
+    seen_f = {}
     for to, txh, blk, amt in recips:
+        if to in seen_f:
+            continue
         f, err = first_funder(to, blk)
+        seen_f[to] = (f, err)
         if f and f.get("tx"):
             print(f"  funder of {to[:12]}..: {f['funder']}"
                   f" tx {f['tx']} blk {f['block']}"
